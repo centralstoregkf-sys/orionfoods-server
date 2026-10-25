@@ -2,6 +2,7 @@ const Payment = require("../models/Payment");
 const Customer = require("../models/Customer");
 const cloudinary = require("../config/cloudinary");
 const fs = require("fs");
+const { notifyAfterPayment } = require("../utils/balanceNotifier");
 
 const removeTempFile = (file) => {
   if (file?.path) fs.unlink(file.path, () => {});
@@ -58,6 +59,9 @@ exports.createPayment = async (req, res) => {
     customer.currentBalance += amt;
     if (isAdmin) customer.totalPaymentsReceived += amt; // already confirmed
     await customer.save();
+
+    // Email if balance is still below the minimum after this payment
+    notifyAfterPayment(customer);
 
     res.status(201).json(payment);
   } catch (error) {

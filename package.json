@@ -21,5 +21,8 @@
     "multer": "^2.4.0",
     "nodeman": "^1.1.2",
     "razorpay": "^2.9.8"
+  },
+  "dependencies": {
+    "nodemailer": "^10.2.1"
   }
 }
