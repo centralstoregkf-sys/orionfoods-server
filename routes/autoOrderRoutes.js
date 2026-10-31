@@ -1,10 +1,12 @@
 const express = require("express");
 const router = express.Router();
-// Use the same auth middleware import as your orderRoutes.js
 const { protect } = require("../middleware/authMiddleware");
-const { getMine, saveMine } = require("../controllers/autoOrderController");
+const { authorize } = require("../middleware/roleMiddleware");
+const { getMine, createMine, editDay, stopMine } = require("../controllers/autoOrderController");
 
-router.get("/me", protect, getMine);
-router.put("/me", protect, saveMine);
+router.get("/me", protect, authorize("customer"), getMine);
+router.post("/me", protect, authorize("customer"), createMine);
+router.put("/me/day", protect, authorize("customer"), editDay);
+router.delete("/me", protect, authorize("customer"), stopMine);
 
 module.exports = router;
