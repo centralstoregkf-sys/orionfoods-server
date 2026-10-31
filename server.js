@@ -13,7 +13,30 @@ const customerRoutes = require("./routes/customerRoutes");
 const orderRoutes = require("./routes/orderRoutes");
 const paymentRoutes = require("./routes/paymentRoutes");
 const autoOrderRoutes = require("./routes/autoOrderRoutes");
-const { startAutoOrderScheduler } = require("./utils/autoOrderRunner");
+
+// --- Safe loader for auto-order scheduler ---
+let startAutoOrderScheduler = null;
+try {
+  const autoOrderRunner = require("./utils/autoOrderRunner");
+  if (typeof autoOrderRunner === "function") {
+    // module.exports = startAutoOrderScheduler (default export)
+    startAutoOrderScheduler = autoOrderRunner;
+  } else if (typeof autoOrderRunner.startAutoOrderScheduler === "function") {
+    startAutoOrderScheduler = autoOrderRunner.startAutoOrderScheduler;
+  } else if (typeof autoOrderRunner.startScheduler === "function") {
+    startAutoOrderScheduler = autoOrderRunner.startScheduler;
+  } else {
+    console.warn(
+      "autoOrderRunner exported keys:",
+      Object.keys(autoOrderRunner || {})
+    );
+    console.warn(
+      "autoOrderRunner has no startAutoOrderScheduler function — scheduler disabled."
+    );
+  }
+} catch (err) {
+  console.warn("Could not load ./utils/autoOrderRunner:", err.message);
+}
 
 // ensure uploads dir
 const uploadsDir = path.join(__dirname, "uploads");
@@ -35,7 +58,23 @@ app.use("/api/auto-orders", autoOrderRoutes);
 app.get("/", (req, res) => res.json({ message: "Food ordering API running" }));
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  startAutoOrderScheduler();
+
+  if (typeof startAutoOrderScheduler === "function") {
+    try {
+      startAutoOrderScheduler();
+      console.log("Auto-order scheduler started.");
+    } catch (err) {
+      console.error("Failed to start auto-order scheduler:", err);
+    }
+  } else {
+    console.warn("Auto-order scheduler is not available. Server will continue normally.");
+  }
+});
+
+// Graceful shutdown (optional but recommended)
+process.on("SIGINT", () => {
+  console.log("Shutting down...");
+  server.close(() => process.exit(0));
 });
