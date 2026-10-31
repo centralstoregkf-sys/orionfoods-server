@@ -5,10 +5,23 @@ const generateToken = require("../utils/generateToken");
 // @desc Register a user (customer signup / all roles create)
 exports.register = async (req, res) => {
   try {
-    const { name, email, password, phone, address, role } = req.body;
+    const { name, email, password, phone, address, pincode, role } = req.body;
 
     if (!name || !email || !password) {
       return res.status(400).json({ message: "Please add all required fields" });
+    }
+
+    const cleanPincode = String(pincode || "").trim();
+    const finalRole = role || "customer";
+
+    // Pincode is required for customer sign-up
+    if (finalRole === "customer") {
+      if (!cleanPincode) {
+        return res.status(400).json({ message: "Pincode is required" });
+      }
+      if (!/^\d{6}$/.test(cleanPincode)) {
+        return res.status(400).json({ message: "Enter a valid 6-digit pincode" });
+      }
     }
 
     const exists = await User.findOne({ email });
@@ -21,8 +34,9 @@ exports.register = async (req, res) => {
       email,
       phone: phone || "",
       address: address || "",
+      pincode: cleanPincode,
       password,
-      role: role || "customer",
+      role: finalRole,
     });
 
     // If customer, create a Customer profile doc
@@ -35,6 +49,7 @@ exports.register = async (req, res) => {
         name,
         phone: phone || "",
         address: address || "",
+        pincode: cleanPincode,
         email,
         openingBalance: 0,
         totalMeals: 0,
