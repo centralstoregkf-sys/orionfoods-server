@@ -1,5 +1,17 @@
 const mongoose = require("mongoose");
 
+/* Saved delivery pin of the customer */
+const locationSchema = new mongoose.Schema(
+  {
+    lat: { type: Number, required: true },
+    lng: { type: Number, required: true },
+    accuracy: { type: Number },
+    note: { type: String, default: "" },
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
+
 const customerSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
@@ -14,6 +26,7 @@ const customerSchema = new mongoose.Schema(
     totalMeals: { type: Number, default: 0 },
     totalPaymentsReceived: { type: Number, default: 0 },
     currentBalance: { type: Number, default: 0 },
+    location: { type: locationSchema, default: undefined },
   },
   { timestamps: true }
 );
