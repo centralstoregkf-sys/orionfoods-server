@@ -3,7 +3,7 @@ const AutoPlan = require("../models/AutoPlan");
 const Customer = require("../models/Customer");
 const { placeOrder, reviseOrder, removeOrder } = require("./orderController");
 const { AUTO_DAYS, autoDayCost } = require("../utils/pricing");
-const { todayIST, addDays, isOpen, assertOpen } = require("../utils/cutoff");
+const { todayIST, addDays, isOpen, assertOpen, dateKey } = require("../utils/cutoff");
 const { assertDeliverable } = require("../utils/delivery");
 const { fail, sendError } = require("../utils/httpError");
 
@@ -163,6 +163,19 @@ exports.createMine = async (req, res) => {
     if (leaves === AUTO_DAYS) fail(400, "Set meals for at least one day");
 
     entries.forEach((c, i) => assertOpen(addDays(startDate, i), usedFlags(c)));
+
+    /* one order per date: none of the plan's meal days may already have an order */
+    const existing = await Order.find({ customer: customer._id }).select("date");
+    const taken = new Set(existing.map((o) => dateKey(o.date)));
+    entries.forEach((c, i) => {
+      const d = addDays(startDate, i);
+      if (sum(c) > 0 && taken.has(d)) {
+        fail(
+          400,
+          `You already have an order on ${d}. Edit or cancel that order first, or choose a different start date for your auto order.`
+        );
+      }
+    });
 
     const total =
       entries.reduce((t, c) => t + (sum(c) > 0 ? costOf(c) : 0), 0) + leaves * costOf(template);
