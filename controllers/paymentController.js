@@ -3,6 +3,7 @@ const Customer = require("../models/Customer");
 const cloudinary = require("../config/cloudinary");
 const fs = require("fs");
 const { notifyAfterPayment } = require("../utils/balanceNotifier");
+const { pushIfBelowMin } = require("../utils/pushNotifier");
 
 const removeTempFile = (file) => {
   if (file?.path) fs.unlink(file.path, () => {});
@@ -62,6 +63,9 @@ exports.createPayment = async (req, res) => {
 
     // Email if balance is still below the minimum after this payment
     notifyAfterPayment(customer);
+
+    // Phone push if balance is still below the minimum after this payment
+    pushIfBelowMin(customer);
 
     res.status(201).json(payment);
   } catch (error) {
