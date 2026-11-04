@@ -1,7 +1,22 @@
 const Customer = require("../models/Customer");
 const User = require("../models/User");
 const { fail, sendError } = require("../utils/httpError");
-const { sanitizeLocation } = require("../utils/delivery");
+const { sanitizeLocation, assertLocationDeliverable } = require("../utils/delivery");
+
+/* Validates the pin's pincode, saves the location and syncs the pincode to Customer + User */
+const saveLocation = async (customer, body) => {
+  const loc = sanitizeLocation(body);
+  const pincode = await assertLocationDeliverable(loc.lat, loc.lng);
+
+  customer.location = loc;
+  customer.pincode = pincode;
+  await customer.save();
+
+  if (customer.user) {
+    await User.findByIdAndUpdate(customer.user, { pincode });
+  }
+  return customer;
+};
 
 exports.getMyProfile = async (req, res) => {
   try {
@@ -68,8 +83,7 @@ exports.updateMyLocation = async (req, res) => {
     const customer = await Customer.findOne({ user: req.user._id });
     if (!customer) fail(404, "Customer profile not found");
 
-    customer.location = sanitizeLocation(req.body);
-    await customer.save();
+    await saveLocation(customer, req.body);
     res.json(customer);
   } catch (error) {
     sendError(res, error);
@@ -81,8 +95,7 @@ exports.updateCustomerLocation = async (req, res) => {
     const customer = await Customer.findById(req.params.id);
     if (!customer) fail(404, "Not found");
 
-    customer.location = sanitizeLocation(req.body);
-    await customer.save();
+    await saveLocation(customer, req.body);
     res.json(customer);
   } catch (error) {
     sendError(res, error);
