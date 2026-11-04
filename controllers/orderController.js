@@ -6,6 +6,7 @@ const { PRICE, normalCost } = require("../utils/pricing");
 const { dateKey, assertOpen } = require("../utils/cutoff");
 const { assertDeliverable } = require("../utils/delivery");
 const { fail, sendError } = require("../utils/httpError");
+const { pushIfCrossedBelowMin } = require("../utils/pushNotifier");
 
 const toCount = (v) => Math.max(0, Math.min(99, Math.floor(Number(v)) || 0));
 
@@ -15,8 +16,24 @@ const ensureBalance = (customer, extra) => {
   }
 };
 
+/* One order per customer per date. Pass exceptId when moving an existing order. */
+const assertNoOrderOnDate = async (customer, date, exceptId) => {
+  const key = dateKey(date);
+  const orders = await Order.find({ customer: customer._id }).select("date");
+  const clash = orders.some(
+    (o) => String(o._id) !== String(exceptId || "") && dateKey(o.date) === key
+  );
+  if (clash) {
+    fail(
+      400,
+      `An order already exists on ${key}. Only one order per date is allowed, so please edit the existing order instead.`
+    );
+  }
+};
+
 const placeOrder = async (customer, { date, bc, lc, dc, totalCost }) => {
   const cost = totalCost === undefined ? normalCost(bc, lc, dc) : totalCost;
+  await assertNoOrderOnDate(customer, date);
   ensureBalance(customer, cost);
   const serviceId = await generateServiceId();
 
@@ -32,9 +49,14 @@ const placeOrder = async (customer, { date, bc, lc, dc, totalCost }) => {
     totalCost: cost,
   });
 
+  const balanceBefore = Number(customer.currentBalance);
+
   customer.totalMeals += bc + lc + dc;
   customer.currentBalance -= cost;
   await customer.save();
+
+  // Phone push if this order pushed the balance below the minimum
+  pushIfCrossedBelowMin(customer, balanceBefore);
 
   return order;
 };
@@ -43,6 +65,10 @@ const reviseOrder = async (customer, order, { date, bc, lc, dc, totalCost }) => 
   const cost = totalCost === undefined ? normalCost(bc, lc, dc) : totalCost;
   const oldMeals = order.breakfastCount + order.lunchCount + order.dinnerCount;
   const delta = cost - order.totalCost;
+
+  if (date && dateKey(date) !== dateKey(order.date)) {
+    await assertNoOrderOnDate(customer, date, order._id);
+  }
   ensureBalance(customer, delta);
 
   if (date) order.date = date;
@@ -52,9 +78,14 @@ const reviseOrder = async (customer, order, { date, bc, lc, dc, totalCost }) => 
   order.totalCost = cost;
   await order.save();
 
+  const balanceBefore = Number(customer.currentBalance);
+
   customer.totalMeals += bc + lc + dc - oldMeals;
   customer.currentBalance -= delta;
   await customer.save();
+
+  // Phone push if this change pushed the balance below the minimum
+  pushIfCrossedBelowMin(customer, balanceBefore);
 
   return order;
 };
