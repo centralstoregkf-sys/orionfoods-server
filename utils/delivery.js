@@ -1,12 +1,12 @@
 const { fail } = require("./httpError");
 
-const DELIVERY_PINCODE = "683565";
+const DELIVERY_PINCODE = "682048";
 
-/* Hotel, Pallikkara. REPLACE with the exact hotel coordinates (same value as the frontend file). */
-const HOTEL_LOCATION = { lat: 10.011, lng: 76.425 };
+/* Kitchen: Golden Cassia Business Hotel, Kakkanad (same value as the frontend file). */
+const KITCHEN_LOCATION = { lat: 10.0166811, lng: 76.361225 };
 
-/* Maximum delivery distance from the hotel, in km */
-const MAX_DELIVERY_KM = 8;
+/* Maximum delivery distance from the kitchen, in km */
+const MAX_DELIVERY_KM = 1;
 
 const isDeliverable = (pincode) => String(pincode || "").trim() === DELIVERY_PINCODE;
 
@@ -52,8 +52,8 @@ const distanceKm = (lat1, lng1, lat2, lng2) => {
   return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 };
 
-const distanceFromHotel = (lat, lng) =>
-  distanceKm(lat, lng, HOTEL_LOCATION.lat, HOTEL_LOCATION.lng);
+const distanceFromKitchen = (lat, lng) =>
+  distanceKm(lat, lng, KITCHEN_LOCATION.lat, KITCHEN_LOCATION.lng);
 
 /* Finds the 6-digit pincode of a map point (OpenStreetMap Nominatim). Returns null if unknown. */
 const resolvePincode = async (lat, lng) => {
@@ -79,14 +79,14 @@ const resolvePincode = async (lat, lng) => {
   }
 };
 
-/* Throws if the spot is too far from the hotel or outside the delivery pincode.
+/* Throws if the spot is too far from the kitchen or outside the delivery pincode.
    Returns the verified pincode. */
 const assertLocationDeliverable = async (lat, lng) => {
-  const km = distanceFromHotel(lat, lng);
+  const km = distanceFromKitchen(lat, lng);
   if (km > MAX_DELIVERY_KM) {
     fail(
       400,
-      `This location is ${km.toFixed(1)} km away from our hotel. We deliver only within ${MAX_DELIVERY_KM} km, so it can't be used for delivery.`
+      `This location is ${km.toFixed(1)} km away from our kitchen. We deliver only within ${MAX_DELIVERY_KM} km, so it can't be used for delivery.`
     );
   }
 
@@ -105,13 +105,16 @@ const assertLocationDeliverable = async (lat, lng) => {
 
 module.exports = {
   DELIVERY_PINCODE,
-  HOTEL_LOCATION,
+  KITCHEN_LOCATION,
   MAX_DELIVERY_KM,
   isDeliverable,
   assertDeliverable,
   sanitizeLocation,
   distanceKm,
-  distanceFromHotel,
+  distanceFromKitchen,
   resolvePincode,
   assertLocationDeliverable,
+  // old names kept so any file still importing them keeps working
+  HOTEL_LOCATION: KITCHEN_LOCATION,
+  distanceFromHotel: distanceFromKitchen,
 };
