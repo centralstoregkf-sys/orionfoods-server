@@ -1,292 +1,268 @@
 const Order = require("../models/Order");
-const AutoPlan = require("../models/AutoPlan");
 const Customer = require("../models/Customer");
-const { placeOrder, reviseOrder, removeOrder } = require("./orderController");
-const { AUTO_DAYS, autoDayCost } = require("../utils/pricing");
-const { todayIST, addDays, isOpen, assertOpen, dateKey } = require("../utils/cutoff");
+const AutoPlan = require("../models/AutoPlan");
+const generateServiceId = require("../utils/serviceIdGenerator");
+const { PRICE, normalCost } = require("../utils/pricing");
+const { dateKey, assertOpen, todayIST } = require("../utils/cutoff");
 const { assertDeliverable } = require("../utils/delivery");
 const { fail, sendError } = require("../utils/httpError");
-const sendEmail = require("../utils/sendEmail");
+const { pushIfCrossedBelowMin } = require("../utils/pushNotifier");
+const sendEmail = require("../utils/sendEmail"); // adjust the path if your email file is named differently
 
-const one = (v) => (Number(v) > 0 ? 1 : 0);
-const readCounts = (src) => ({
-  b: one(src && src.breakfastCount),
-  l: one(src && src.lunchCount),
-  d: one(src && src.dinnerCount),
-});
-const sum = (c) => c.b + c.l + c.d;
-const costOf = (c) => autoDayCost(c.b, c.l, c.d);
-const writeCounts = (day, c) => {
-  day.breakfastCount = c.b;
-  day.lunchCount = c.l;
-  day.dinnerCount = c.d;
-};
-const changedFlags = (prev, next) => ({
-  breakfast: prev.b !== next.b,
-  lunch: prev.l !== next.l,
-  dinner: prev.d !== next.d,
-});
-const usedFlags = (c) => ({ breakfast: c.b > 0, lunch: c.l > 0, dinner: c.d > 0 });
+/* Email the customer when the balance reaches ₹500 or goes below it */
+const LOW_BALANCE_EMAIL_AT = sendEmail.LOW_BALANCE_EMAIL_AT;
 
-const customerOf = async (req) => {
-  const customer = await Customer.findOne({ user: req.user._id });
-  if (!customer) fail(404, "Customer profile not found");
-  return customer;
-};
+const toCount = (v) => Math.max(0, Math.min(99, Math.floor(Number(v)) || 0));
 
-const isFinished = (plan) =>
-  !plan.active || plan.days.every((d) => d.cancelled || d.date < todayIST());
-
-const lastDate = (plan) => plan.days.reduce((max, d) => (d.date > max ? d.date : max), "");
-
-const dropOrder = async (customer, day) => {
-  if (!day.order) return;
-  const order = await Order.findById(day.order);
-  if (order) await removeOrder(customer, order);
-  day.order = null;
-};
-
-const saveDayOrder = async (customer, day, c) => {
-  const existing = day.order ? await Order.findById(day.order) : null;
-  const payload = { bc: c.b, lc: c.l, dc: c.d, totalCost: costOf(c) };
-  const order = existing
-    ? await reviseOrder(customer, existing, payload)
-    : await placeOrder(customer, { date: day.date, ...payload });
-  day.order = order._id;
-};
-
-const appendExtension = async (customer, plan, c) => {
-  const day = {
-    date: addDays(lastDate(plan), 1),
-    breakfastCount: c.b,
-    lunchCount: c.l,
-    dinnerCount: c.d,
-    order: null,
-    cancelled: false,
-    extended: true,
-  };
-  await saveDayOrder(customer, day, c);
-  plan.days.push(day);
-};
-
-const releaseExtension = async (customer, plan) => {
-  let index = -1;
-  plan.days.forEach((d, i) => {
-    if (d.extended && !d.cancelled) index = i;
-  });
-  if (index < 0) fail(400, "This leave day can't be restored.");
-  const ext = plan.days[index];
-  assertOpen(ext.date, usedFlags(readCounts(ext)));
-  await dropOrder(customer, ext);
-  plan.days.splice(index, 1);
-};
-
-const applyDay = async (customer, plan, day, next, extend) => {
-  const prev = readCounts(day);
-  const flags = changedFlags(prev, next);
-  if (!flags.breakfast && !flags.lunch && !flags.dinner) return;
-
-  if (sum(next) === 0) {
-    await dropOrder(customer, day);
-    day.was = { breakfastCount: prev.b, lunchCount: prev.l, dinnerCount: prev.d };
-    writeCounts(day, next);
-    day.cancelled = true;
-    if (extend && sum(prev) > 0) await appendExtension(customer, plan, prev);
-    return;
-  }
-
-  if (day.cancelled) await releaseExtension(customer, plan);
-  await saveDayOrder(customer, day, next);
-  writeCounts(day, next);
-  day.cancelled = false;
-};
-
-const view = (plan) => {
-  if (!plan) return { plan: null };
-  const days = plan.days
-    .slice()
-    .sort((a, b) => a.date.localeCompare(b.date))
-    .map((d) => {
-      const c = readCounts(d);
-      return {
-        date: d.date,
-        breakfastCount: c.b,
-        lunchCount: c.l,
-        dinnerCount: c.d,
-        cancelled: Boolean(d.cancelled),
-        extended: Boolean(d.extended),
-        cost: d.cancelled ? 0 : costOf(c),
-      };
-    });
-  return {
-    plan: {
-      active: plan.active && !isFinished(plan),
-      startDate: plan.startDate,
-      days,
-      mealDays: days.filter((d) => !d.cancelled).length,
-      totalCost: days.reduce((t, d) => t + d.cost, 0),
-    },
-  };
-};
-
-exports.getMine = async (req, res) => {
-  try {
-    const customer = await customerOf(req);
-    const plan = await AutoPlan.findOne({ customer: customer._id });
-    res.json(view(plan));
-  } catch (error) {
-    sendError(res, error);
+const ensureBalance = (customer, extra) => {
+  if (extra > 0 && Number(customer.currentBalance) - extra <= 0) {
+    fail(400, "Not enough balance. Your balance must stay above ₹0. Please add a payment first.");
   }
 };
 
-exports.createMine = async (req, res) => {
-  try {
-    const customer = await customerOf(req);
-    assertDeliverable(customer);
+/* Sends one email when this change moved the balance from above ₹500 to ₹500 or below.
+   Never blocks or breaks the order if the email fails.
+   After it is sent, today is marked so the daily reminder doesn't repeat it the same day. */
+const emailIfCrossedMinimum = (customer, balanceBefore) => {
+  const after = Number(customer.currentBalance);
+  const before = Number(balanceBefore);
+  if (!customer.email) return;
+  if (!(before > LOW_BALANCE_EMAIL_AT && after <= LOW_BALANCE_EMAIL_AT)) return;
 
-    const current = await AutoPlan.findOne({ customer: customer._id });
-    if (current && !isFinished(current)) {
-      fail(400, "You already have an auto order running. Edit its dates or stop it first.");
-    }
-
-    const startDate = String(req.body.startDate || "");
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || startDate <= todayIST()) {
-      fail(400, "Start date must be tomorrow or later");
-    }
-
-    const template = readCounts(req.body.template);
-    if (sum(template) === 0) fail(400, "Choose the meals for your auto order");
-
-    const entries = Array.from({ length: AUTO_DAYS }, (_, i) =>
-      readCounts(req.body.days && req.body.days[i])
-    );
-    const leaves = entries.filter((e) => sum(e) === 0).length;
-    if (leaves === AUTO_DAYS) fail(400, "Set meals for at least one day");
-
-    entries.forEach((c, i) => assertOpen(addDays(startDate, i), usedFlags(c)));
-
-    /* one order per date: none of the plan's meal days may already have an order */
-    const existing = await Order.find({ customer: customer._id }).select("date");
-    const taken = new Set(existing.map((o) => dateKey(o.date)));
-    entries.forEach((c, i) => {
-      const d = addDays(startDate, i);
-      if (sum(c) > 0 && taken.has(d)) {
-        fail(
-          400,
-          `You already have an order on ${d}. Edit or cancel that order first, or choose a different start date for your auto order.`
-        );
-      }
-    });
-
-    const total =
-      entries.reduce((t, c) => t + (sum(c) > 0 ? costOf(c) : 0), 0) + leaves * costOf(template);
-    if (Number(customer.currentBalance) - total <= 0) {
-      fail(
-        400,
-        `Your auto order needs ₹${total}. Your balance must stay above ₹0 after this, so please add a payment first.`
+  sendEmail
+    .trySend(customer.email, sendEmail.lowBalanceEmail(customer, after))
+    .then((sent) => {
+      if (!sent) return;
+      return Customer.collection.updateOne(
+        { _id: customer._id },
+        { $set: { lowBalanceEmailDate: todayIST() } }
       );
+    })
+    .catch((err) => console.error("Low balance email mark failed:", err.message));
+};
+
+/* One order per customer per date. Pass exceptId when moving an existing order. */
+const assertNoOrderOnDate = async (customer, date, exceptId) => {
+  const key = dateKey(date);
+  const orders = await Order.find({ customer: customer._id }).select("date");
+  const clash = orders.some(
+    (o) => String(o._id) !== String(exceptId || "") && dateKey(o.date) === key
+  );
+  if (clash) {
+    fail(
+      400,
+      `An order already exists on ${key}. Only one order per date is allowed, so please edit the existing order instead.`
+    );
+  }
+};
+
+/* notify: true -> also email the customer an order confirmation (used for normal orders only;
+   auto-order days are covered by one single auto-order email). */
+const placeOrder = async (customer, { date, bc, lc, dc, totalCost }, { notify = false } = {}) => {
+  const cost = totalCost === undefined ? normalCost(bc, lc, dc) : totalCost;
+  await assertNoOrderOnDate(customer, date);
+  ensureBalance(customer, cost);
+  const serviceId = await generateServiceId();
+
+  const order = await Order.create({
+    serviceId,
+    customer: customer._id,
+    customerId: customer.customerId,
+    email: customer.email,
+    date,
+    breakfastCount: bc,
+    lunchCount: lc,
+    dinnerCount: dc,
+    totalCost: cost,
+  });
+
+  const balanceBefore = Number(customer.currentBalance);
+
+  customer.totalMeals += bc + lc + dc;
+  customer.currentBalance -= cost;
+  await customer.save();
+
+  // Order confirmation email (normal orders)
+  if (notify && customer.email) {
+    sendEmail.trySend(customer.email, sendEmail.orderEmail(customer, order, dateKey(order.date)));
+  }
+
+  // Phone push if this order pushed the balance below the minimum
+  pushIfCrossedBelowMin(customer, balanceBefore);
+  // Email if the balance reached ₹500 or below
+  emailIfCrossedMinimum(customer, balanceBefore);
+
+  return order;
+};
+
+const reviseOrder = async (customer, order, { date, bc, lc, dc, totalCost }) => {
+  const cost = totalCost === undefined ? normalCost(bc, lc, dc) : totalCost;
+  const oldMeals = order.breakfastCount + order.lunchCount + order.dinnerCount;
+  const delta = cost - order.totalCost;
+
+  if (date && dateKey(date) !== dateKey(order.date)) {
+    await assertNoOrderOnDate(customer, date, order._id);
+  }
+  ensureBalance(customer, delta);
+
+  if (date) order.date = date;
+  order.breakfastCount = bc;
+  order.lunchCount = lc;
+  order.dinnerCount = dc;
+  order.totalCost = cost;
+  await order.save();
+
+  const balanceBefore = Number(customer.currentBalance);
+
+  customer.totalMeals += bc + lc + dc - oldMeals;
+  customer.currentBalance -= delta;
+  await customer.save();
+
+  // Phone push if this change pushed the balance below the minimum
+  pushIfCrossedBelowMin(customer, balanceBefore);
+  // Email if the balance reached ₹500 or below
+  emailIfCrossedMinimum(customer, balanceBefore);
+
+  return order;
+};
+
+const removeOrder = async (customer, order) => {
+  customer.totalMeals -= order.breakfastCount + order.lunchCount + order.dinnerCount;
+  customer.currentBalance += order.totalCost;
+  await customer.save();
+  await Order.findByIdAndDelete(order._id);
+};
+
+exports.PRICE = PRICE;
+exports.placeOrder = placeOrder;
+exports.reviseOrder = reviseOrder;
+exports.removeOrder = removeOrder;
+
+exports.createOrder = async (req, res) => {
+  try {
+    const { date, breakfastCount, lunchCount, dinnerCount, customer: customerRef } = req.body;
+
+    const isPrivileged = ["admin", "staff"].includes(req.user.role);
+    const customer =
+      isPrivileged && customerRef
+        ? await Customer.findById(customerRef)
+        : await Customer.findOne({ user: req.user._id });
+
+    if (!customer) fail(404, "Customer profile not found");
+    if (!isPrivileged) assertDeliverable(customer);
+    if (!date) fail(400, "Please select a date");
+
+    const bc = toCount(breakfastCount);
+    const lc = toCount(lunchCount);
+    const dc = toCount(dinnerCount);
+    if (bc + lc + dc === 0) fail(400, "Add at least one meal");
+
+    if (!isPrivileged) {
+      assertOpen(dateKey(date), { breakfast: bc > 0, lunch: lc > 0, dinner: dc > 0 });
     }
 
-    if (current) await AutoPlan.deleteOne({ _id: current._id });
+    const order = await placeOrder(customer, { date, bc, lc, dc }, { notify: true });
+    res.status(201).json(order);
+  } catch (error) {
+    sendError(res, error);
+  }
+};
 
-    const plan = new AutoPlan({
-      customer: customer._id,
-      active: true,
-      startDate,
-      template: { breakfastCount: template.b, lunchCount: template.l, dinnerCount: template.d },
-      days: [],
+exports.getMyOrders = async (req, res) => {
+  try {
+    const customer = await Customer.findOne({ user: req.user._id });
+    if (!customer) return res.status(404).json({ message: "Not found" });
+
+    const orders = await Order.find({ customer: customer._id }).sort({ createdAt: -1 });
+    res.json(orders);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.getAllOrders = async (req, res) => {
+  try {
+    const orders = await Order.find()
+      .populate("customer", "name customerId phone email address pincode location")
+      .sort({ createdAt: -1 });
+    res.json(orders);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.updateMyOrder = async (req, res) => {
+  try {
+    const customer = await Customer.findOne({ user: req.user._id });
+    if (!customer) fail(404, "Customer profile not found");
+
+    const order = await Order.findOne({ _id: req.params.id, customer: customer._id });
+    if (!order) fail(404, "Order not found");
+
+    const inPlan = await AutoPlan.exists({ customer: customer._id, "days.order": order._id });
+    if (inPlan) fail(400, "This order is part of your auto order. Edit it from Set auto order.");
+
+    const date = dateKey(order.date);
+    const next = {
+      breakfast: toCount(req.body.breakfastCount),
+      lunch: toCount(req.body.lunchCount),
+      dinner: toCount(req.body.dinnerCount),
+    };
+
+    assertOpen(date, {
+      breakfast: next.breakfast !== order.breakfastCount,
+      lunch: next.lunch !== order.lunchCount,
+      dinner: next.dinner !== order.dinnerCount,
     });
 
-    try {
-      for (let i = 0; i < AUTO_DAYS; i += 1) {
-        const c = entries[i];
-        const day = {
-          date: addDays(startDate, i),
-          breakfastCount: c.b,
-          lunchCount: c.l,
-          dinnerCount: c.d,
-          order: null,
-          cancelled: sum(c) === 0,
-          extended: false,
-        };
-        if (sum(c) === 0) {
-          day.was = { breakfastCount: template.b, lunchCount: template.l, dinnerCount: template.d };
-        } else {
-          await saveDayOrder(customer, day, c);
-        }
-        plan.days.push(day);
-      }
-      for (let i = 0; i < leaves; i += 1) {
-        await appendExtension(customer, plan, template);
-      }
-    } catch (error) {
-      for (const d of plan.days) {
-        try {
-          await dropOrder(customer, d);
-        } catch (rollbackError) {
-          console.error(rollbackError.message);
-        }
-      }
-      throw error;
+    if (next.breakfast + next.lunch + next.dinner === 0) {
+      await removeOrder(customer, order);
+      return res.json({ deleted: true });
     }
 
-    await plan.save();
-
-    const result = view(plan);
-
-    // One email for the whole auto order: start date, end date, every day and the total
-    sendEmail.trySend(customer.email, sendEmail.autoOrderEmail(customer, result.plan));
-
-    res.status(201).json(result);
+    await reviseOrder(customer, order, { bc: next.breakfast, lc: next.lunch, dc: next.dinner });
+    res.json(order);
   } catch (error) {
     sendError(res, error);
   }
 };
 
-exports.editDay = async (req, res) => {
+exports.updateOrder = async (req, res) => {
   try {
-    const customer = await customerOf(req);
-    const plan = await AutoPlan.findOne({ customer: customer._id, active: true });
-    if (!plan || isFinished(plan)) fail(404, "You have no running auto order");
+    const order = await Order.findById(req.params.id);
+    if (!order) fail(404, "Not found");
 
-    const date = String(req.body.date || "");
-    const day = plan.days.find((d) => d.date === date);
-    if (!day) fail(404, "That date is not part of your auto order");
+    const customer = await Customer.findById(order.customer);
+    if (!customer) fail(404, "Customer missing");
 
-    const next = readCounts(req.body);
-    assertOpen(date, changedFlags(readCounts(day), next));
+    const { date, breakfastCount, lunchCount, dinnerCount } = req.body;
+    await reviseOrder(customer, order, {
+      date: date || undefined,
+      bc: toCount(breakfastCount),
+      lc: toCount(lunchCount),
+      dc: toCount(dinnerCount),
+    });
 
-    await applyDay(customer, plan, day, next, true);
-    plan.markModified("days");
-    await plan.save();
-    res.json(view(plan));
+    res.json(order);
   } catch (error) {
     sendError(res, error);
   }
 };
 
-exports.stopMine = async (req, res) => {
+exports.deleteOrder = async (req, res) => {
   try {
-    const customer = await customerOf(req);
-    const plan = await AutoPlan.findOne({ customer: customer._id, active: true });
-    if (!plan || isFinished(plan)) fail(404, "You have no running auto order");
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ message: "Not found" });
 
-    for (const day of plan.days) {
-      if (day.cancelled) continue;
-      const prev = readCounts(day);
-      const keep = {
-        b: isOpen(day.date, "breakfast") ? 0 : prev.b,
-        l: isOpen(day.date, "lunch") ? 0 : prev.l,
-        d: isOpen(day.date, "dinner") ? 0 : prev.d,
-      };
-      await applyDay(customer, plan, day, keep, false);
+    const customer = await Customer.findById(order.customer);
+    if (customer) {
+      await removeOrder(customer, order);
+    } else {
+      await Order.findByIdAndDelete(req.params.id);
     }
 
-    plan.active = false;
-    plan.markModified("days");
-    await plan.save();
-    res.json(view(plan));
+    res.json({ message: "Order deleted" });
   } catch (error) {
-    sendError(res, error);
+    res.status(500).json({ message: error.message });
   }
 };
