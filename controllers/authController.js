@@ -1,6 +1,10 @@
+const { OAuth2Client } = require("google-auth-library");
 const User = require("../models/User");
 const Customer = require("../models/Customer");
 const generateToken = require("../utils/generateToken");
+const sendEmail = require("../utils/sendEmail");
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // @desc Register a user (customer signup / all roles create)
 exports.register = async (req, res) => {
@@ -58,6 +62,9 @@ exports.register = async (req, res) => {
       });
     }
 
+    // Welcome email (never blocks or breaks registration)
+    sendEmail.trySend(user.email, sendEmail.welcomeEmail(user));
+
     res.status(201).json({
       _id: user._id,
       name: user.name,
@@ -86,6 +93,9 @@ exports.login = async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
+    // Sign-in email (never blocks or breaks login)
+    sendEmail.trySend(user.email, sendEmail.loginEmail(user));
+
     res.json({
       _id: user._id,
       name: user.name,
@@ -96,6 +106,51 @@ exports.login = async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc Login with Google (only for users who are already registered)
+exports.googleLogin = async (req, res) => {
+  try {
+    const { credential } = req.body;
+    if (!credential) {
+      return res.status(400).json({ message: "Google credential missing" });
+    }
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+
+    if (!payload || !payload.email || !payload.email_verified) {
+      return res.status(400).json({ message: "Google account email is not verified" });
+    }
+
+    const email = payload.email.toLowerCase();
+    const user = await User.findOne({ email });
+
+    // Not registered -> do NOT create an account
+    if (!user) {
+      return res.status(404).json({
+        code: "NOT_REGISTERED",
+        message: "This Google account is not registered. Please create an account first.",
+      });
+    }
+
+    // Sign-in email (never blocks or breaks login)
+    sendEmail.trySend(user.email, sendEmail.loginEmail(user));
+
+    res.json({
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      token: generateToken(user._id),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(401).json({ message: "Google sign-in failed. Please try again." });
   }
 };
 
