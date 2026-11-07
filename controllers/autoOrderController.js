@@ -6,6 +6,7 @@ const { AUTO_DAYS, autoDayCost } = require("../utils/pricing");
 const { todayIST, addDays, isOpen, assertOpen, dateKey } = require("../utils/cutoff");
 const { assertDeliverable } = require("../utils/delivery");
 const { fail, sendError } = require("../utils/httpError");
+const sendEmail = require("../utils/sendEmail");
 
 const one = (v) => (Number(v) > 0 ? 1 : 0);
 const readCounts = (src) => ({
@@ -230,7 +231,13 @@ exports.createMine = async (req, res) => {
     }
 
     await plan.save();
-    res.status(201).json(view(plan));
+
+    const result = view(plan);
+
+    // One email for the whole auto order: start date, end date, every day and the total
+    sendEmail.trySend(customer.email, sendEmail.autoOrderEmail(customer, result.plan));
+
+    res.status(201).json(result);
   } catch (error) {
     sendError(res, error);
   }
