@@ -23,6 +23,7 @@
     "razorpay": "^2.9.8"
   },
   "dependencies": {
+    "google-auth-library": "^11.3.3",
     "nodemailer": "^10.2.1"
   }
 }
