@@ -11,11 +11,13 @@ const authHeader = (key) => (key.startsWith("os_") ? `Key ${key}` : `Basic ${key
 // Today's date in India, so "once a day" follows IST
 const istDate = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
+const logKey = (customerId) => `low-${customerId}-${istDate()}`;
+
 /* Marks "this customer got a low-balance push today".
    Returns true only for the first call of the day. Never throws. */
 const claimToday = async (customerId) => {
   try {
-    await PushLog.create({ key: `low-${customerId}-${istDate()}` });
+    await PushLog.create({ key: logKey(customerId) });
     return true;
   } catch (err) {
     if (err.code !== 11000) console.error("[push] log error:", err.message);
@@ -23,7 +25,18 @@ const claimToday = async (customerId) => {
   }
 };
 
-/* Never throws: a push problem must never break an order or payment. */
+/* Gives today's claim back when the push did not really go out, so it can be retried. Never throws. */
+const releaseToday = async (customerIds) => {
+  try {
+    const keys = [].concat(customerIds || []).map(logKey);
+    if (keys.length) await PushLog.deleteMany({ key: { $in: keys } });
+  } catch (err) {
+    console.error("[push] release error:", err.message);
+  }
+};
+
+/* Never throws: a push problem must never break an order or payment.
+   Returns true only when OneSignal accepted the push AND found at least one recipient. */
 const sendPush = async (externalIds, { title, message, url } = {}) => {
   try {
     const appId = process.env.ONESIGNAL_APP_ID;
@@ -34,22 +47,25 @@ const sendPush = async (externalIds, { title, message, url } = {}) => {
           apiKey ? "set" : "MISSING"
         }). Push skipped.`
       );
-      return;
+      return false;
     }
 
     const ids = [...new Set([].concat(externalIds || []).filter(Boolean).map(String))];
     if (ids.length === 0) {
       console.warn("[push] no external ids to send to, skipped");
-      return;
+      return false;
     }
 
     console.log(`[push] sending to ${ids.length} user(s), app ${appId.slice(0, 8)}..., key ${apiKey.slice(0, 4)}...`);
 
+    let delivered = false;
+
     for (let i = 0; i < ids.length; i += 1000) {
+      const batch = ids.slice(i, i + 1000);
       const body = {
         app_id: appId,
         target_channel: "push",
-        include_aliases: { external_id: ids.slice(i, i + 1000) },
+        include_aliases: { external_id: batch },
         headings: { en: title },
         contents: { en: message },
       };
@@ -67,12 +83,35 @@ const sendPush = async (externalIds, { title, message, url } = {}) => {
       const text = await res.text();
       if (!res.ok) {
         console.error("[push] OneSignal error", res.status, text);
+        continue;
+      }
+
+      // OneSignal answers 200 even when nobody matched: the id is empty and `errors` explains why
+      let data = {};
+      try {
+        data = JSON.parse(text);
+      } catch {
+        /* keep empty */
+      }
+
+      if (!data.id) {
+        console.warn(
+          "[push] OneSignal accepted the request but found NO recipient. " +
+            "The subscription's External ID does not match these ids:",
+          batch.join(", "),
+          "| response:",
+          text
+        );
       } else {
-        console.log("[push] OneSignal accepted:", text);
+        delivered = true;
+        console.log("[push] OneSignal delivered:", text);
       }
     }
+
+    return delivered;
   } catch (err) {
     console.error("[push] failed:", err.message);
+    return false;
   }
 };
 
@@ -101,7 +140,9 @@ const pushIfCrossedBelowMin = (customer, balanceBefore) => {
   (async () => {
     // mark today as done so the daily reminder does not repeat this push
     await claimToday(customer._id);
-    await sendPush(customer.user, lowBalanceMessage());
+    const ok = await sendPush(customer.user, lowBalanceMessage());
+    // nothing was delivered: give the claim back so the daily reminder / next check can retry
+    if (!ok) await releaseToday(customer._id);
   })().catch((err) => console.error("[push] failed:", err.message));
 };
 
@@ -122,7 +163,8 @@ const pushIfBelowMin = (customer) => {
 
   (async () => {
     if (await claimToday(customer._id)) {
-      await sendPush(customer.user, lowBalanceMessage());
+      const ok = await sendPush(customer.user, lowBalanceMessage());
+      if (!ok) await releaseToday(customer._id);
     } else {
       console.log("[push] already notified today, no push");
     }
@@ -138,13 +180,21 @@ const sendDailyLowBalanceReminders = async () => {
   }).select("user");
 
   const recipients = [];
+  const claimedIds = [];
   for (const c of customers) {
-    if (await claimToday(c._id)) recipients.push(c.user);
+    if (await claimToday(c._id)) {
+      recipients.push(c.user);
+      claimedIds.push(c._id);
+    }
   }
 
   if (recipients.length === 0) return 0;
 
-  await sendPush(recipients, lowBalanceMessage());
+  const ok = await sendPush(recipients, lowBalanceMessage());
+  if (!ok) {
+    await releaseToday(claimedIds);
+    return 0;
+  }
   return recipients.length;
 };
 
